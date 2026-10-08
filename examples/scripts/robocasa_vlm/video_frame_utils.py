@@ -12,6 +12,7 @@ import tempfile
 from collections import OrderedDict
 from functools import lru_cache
 import pdb
+import numpy as np
 from PIL import Image
 
 _S3_VIDEO_CACHE_DIR = os.path.join(tempfile.gettempdir(), "video_s3_cache")
@@ -52,6 +53,15 @@ def _get_video_reader(video_path: str):
 
 
 def extract_frame(source_path: str, frame_idx: int) -> Image.Image:
+    if os.environ.get("ROBOCRITIC_MIRAGE", "0") != "1":
+        return _extract_frame(source_path, frame_idx)
+    frames = [np.asarray(_extract_frame(source_path, max(0, frame_idx - offset)).convert("RGB"),
+                         dtype=np.float32) for offset in (16, 12, 8, 4, 0)]
+    blended = sum(weight * frame for weight, frame in zip((.04, .08, .12, .16, .60), frames))
+    return Image.fromarray(np.rint(blended).clip(0, 255).astype(np.uint8))
+
+
+def _extract_frame(source_path: str, frame_idx: int) -> Image.Image:
     """
     Extract a single frame as a PIL Image.
 

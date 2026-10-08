@@ -35,12 +35,15 @@ import re
 import sys
 from dataclasses import dataclass, field
 from functools import lru_cache
-from collections import Counter
+from collections import Counter, defaultdict
+from pathlib import Path
+from PIL import Image
+from matplotlib import pyplot as plt, gridspec
 from typing import List
 
 import torch
 from datasets import Dataset
-from transformers import AutoModelForImageTextToText, AutoProcessor
+from transformers import AutoModelForImageTextToText, AutoProcessor, TrainerCallback
 
 from trl import (
     ModelConfig,
@@ -576,7 +579,7 @@ USER_PROMPT_TEMPLATE = (
     "Which image shows more task progress (the first or the second)? "
     "Respond with a number from -100 to 100."
 )
-from video_frame_utils import find_job_dirs  # noqa: E402
+from video_frame_utils import find_job_dirs, extract_frame, create_side_by_side  # noqa: E402
 
 # For multi-task training we want a per-video natural-language description in
 # the prompt. PairwiseSignAccuracyCallback re-renders the user text at eval
@@ -826,6 +829,7 @@ class RolloutArgs:
     subsample: int = 1  # frame stride (videos are 10 fps)
     eval_max_pairs: int = 200
     just_visualize: bool = False
+    eval_only: bool = False  # Score every held-out pair without training.
     max_pixels: str = "256x256"  # WxH; processor budget per image
     balance_fail_vs_succ: bool = False
 
@@ -951,6 +955,30 @@ if __name__ == "__main__":
     rng = random.Random(42)
     rng.shuffle(train_pairs)
     rng.shuffle(eval_pairs)
+
+    if cfg.eval_only:
+        from rank_videos import load_ranker, _build_prompt_text, _run_pair_chunk
+        assert len({pair["task_token"] for pair in eval_pairs}) == 1, "Expected one OpenDrawer prompt"
+        processor, model = load_ranker(model_args.model_name_or_path, cfg.max_pixels)
+        correct = 0
+        for start in range(0, len(eval_pairs), 4):
+            batch = eval_pairs[start:start + 4]
+            frames = [extract_frame(pair[f"video_path_{side}"], pair[f"frame_idx_{side}"])
+                      for pair in batch for side in (1, 2)]
+            prompt = _build_prompt_text(processor, frames,
+                                       USER_PROMPT_TEMPLATE.format(task_token=batch[0]["task_token"]))
+            answers = _run_pair_chunk(processor, model, frames,
+                                      [(2*i, 2*i+1) for i in range(len(batch))], prompt)
+            for pair, (_, _, text) in zip(batch, answers):
+                match = re.search(r"-?\d+", text)
+                correct += match is not None and ((int(match.group()) > 0) == (pair["correct_answer"] > 0))
+            logger.info(f"Evaluated {start + len(batch)}/{len(eval_pairs)} pairs")
+        result = dict(pairs=len(eval_pairs), correct=correct)
+        result["accuracy"] = result["correct"] / result["pairs"]
+        print(json.dumps(result))
+        os.makedirs(training_args.output_dir, exist_ok=True)
+        Path(training_args.output_dir, "accuracy.json").write_text(json.dumps(result, indent=2))
+        sys.exit(0)
 
     try:
         import torch.distributed as dist
